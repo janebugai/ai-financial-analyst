@@ -1,0 +1,8 @@
+# Local secrets, caches, virtualenvs, and SQLite files
+.env
+__pycache__/
+*.pyc
+instance/
+*.db
+.venv/
+venv/

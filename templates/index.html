@@ -1,0 +1,282 @@
+{# Home page: ticker form, live metrics, 30-day Chart.js line, AI financial summary. #}
+{% extends "base.html" %}
+{% block content %}
+<div class="row">
+  <div class="col-md-10 offset-md-1">
+    <h3 class="mb-3" style="color: #36454F; font-size: 1.5rem;">AI Investment Brief</h3>
+    <form id="analyze-form" class="mb-3">
+      <div class="input-group">
+        <input type="text" id="ticker" name="ticker" class="form-control" placeholder="Select Ticker (e.g. AAPL)" value="{{ ticker or '' }}" required>
+        <button id="analyze-btn" class="btn btn-primary" type="submit">Analyze</button>
+      </div>
+    </form>
+
+    <div id="analysis-area" class="card shadow p-4" style="display:none;">
+      <h3 id="analysis-title" class="mb-3 text-primary"></h3>
+
+      <div class="row align-items-center mb-3">
+        <div class="col-md-4">
+          <p><strong>Price:</strong> $<span id="analysis-price"></span></p>
+          <p>
+            <strong>Change:</strong>
+            <span id="analysis-change"></span>
+          </p>
+          <p><strong>P/E Ratio:</strong> <span id="analysis-pe"></span></p>
+          <p class="mb-0"><strong>Beta:</strong> <span id="analysis-beta"></span></p>
+        </div>
+        <div class="col-md-8">
+          <div class="d-flex justify-content-between align-items-baseline mb-1">
+            <span class="text-secondary fw-semibold">Price history (30 days)</span>
+          </div>
+          <div class="price-chart-wrap">
+            <canvas id="price-chart"></canvas>
+          </div>
+          <p id="price-chart-empty" class="text-muted mb-0" style="display:none;">No price history available.</p>
+        </div>
+      </div>
+
+      <hr>
+
+      <h5 class="mt-4 text-secondary">Financial Summary</h5>
+      <div id="analysis-insight" class="p-3 border rounded bg-light insight-content"></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+/** Escape text before inserting HTML (fallback if the API does not send insight_html). */
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** Turn plain insight text into justified paragraphs. */
+function formatInsight(text) {
+  const escaped = escapeHtml(text || "No insight available.");
+  return escaped
+    .split(/\n\s*\n/)
+    .map(function (para) {
+      return "<p>" + para.replace(/\n/g, "<br>") + "</p>";
+    })
+    .join("");
+}
+
+let priceChart = null;
+
+/** Short month/day label for chart x-axis ticks. */
+function formatChartDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value ?? "");
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+/** Hover-only vertical crosshair and date/price label (Chart.js tooltip is disabled). */
+const priceCrosshair = {
+  id: "priceCrosshair",
+  afterDraw: function (chart) {
+    const tooltip = chart.tooltip;
+    if (!tooltip || !tooltip.getActiveElements().length) return;
+    const { ctx, chartArea } = chart;
+    const active = tooltip.getActiveElements()[0];
+    const meta = chart.getDatasetMeta(active.datasetIndex);
+    const pt = meta.data[active.index];
+    if (!pt) return;
+    const x = pt.x;
+    const y = pt.y;
+    const price = chart.data.datasets[active.datasetIndex].data[active.index];
+    const label = chart.data.labels[active.index] || "";
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "#838383";
+    ctx.moveTo(x, chartArea.top);
+    ctx.lineTo(x, chartArea.bottom);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(x, y, 5, 0, Math.PI * 2);
+    ctx.fillStyle = "#fff";
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = chart.data.datasets[active.datasetIndex].borderColor;
+    ctx.stroke();
+
+    const text = label + "  $" + Number(price).toFixed(2);
+    ctx.font = "12px system-ui, sans-serif";
+    const padX = 8;
+    const textW = ctx.measureText(text).width;
+    const boxW = textW + padX * 2;
+    const boxH = 22;
+    let boxX = x - boxW / 2;
+    let boxY = y - boxH - 10;
+    boxX = Math.max(chartArea.left, Math.min(boxX, chartArea.right - boxW));
+    if (boxY < chartArea.top) boxY = y + 12;
+    ctx.fillStyle = "rgba(33, 37, 41, 0.9)";
+    ctx.beginPath();
+    ctx.roundRect(boxX, boxY, boxW, boxH, 4);
+    ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, boxX + padX, boxY + boxH / 2);
+    ctx.restore();
+  },
+};
+
+/** Draw or replace the 30-day close chart. lineColor is green, red, or default blue. */
+function renderPriceChart(history, lineColor) {
+  const canvas = document.getElementById("price-chart");
+  const empty = document.getElementById("price-chart-empty");
+  const wrap = canvas.parentElement;
+
+  const points = (history || []).map(function (row) {
+    const label = row.Date || row.Datetime || row.date || "";
+    const close = row.Close ?? row.close ?? row["Adj Close"];
+    const num = parseFloat(close);
+    return { label: formatChartDate(label), value: num };
+  }).filter(function (p) { return !isNaN(p.value); });
+
+  if (priceChart) {
+    priceChart.destroy();
+    priceChart = null;
+  }
+
+  if (!points.length) {
+    wrap.style.display = "none";
+    empty.style.display = "block";
+    return;
+  }
+
+  wrap.style.display = "block";
+  empty.style.display = "none";
+  const color = lineColor === "green" ? "#198754" : lineColor === "red" ? "#dc3545" : "#0d6efd";
+
+  priceChart = new Chart(canvas, {
+    type: "line",
+    plugins: [priceCrosshair],
+    data: {
+      labels: points.map(function (p) { return p.label; }),
+      datasets: [{
+        data: points.map(function (p) { return p.value; }),
+        borderColor: color,
+        backgroundColor: color + "22",
+        fill: true,
+        tension: 0.25,
+        pointRadius: 0,
+        pointHoverRadius: 5,
+        borderWidth: 2,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      interaction: {
+        mode: "index",
+        intersect: false,
+        axis: "x",
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: { enabled: false },
+      },
+      scales: {
+        x: {
+          ticks: { maxTicksLimit: 6, maxRotation: 0 },
+          grid: { display: false },
+        },
+        y: {
+          ticks: {
+            callback: function (value) { return "$" + value; },
+          },
+        },
+      },
+    },
+  });
+}
+
+document.getElementById("analyze-form").addEventListener("submit", async function(e){
+  // POST /api/analyze, then fill metrics, summary, and chart on this page.
+  e.preventDefault();
+  const ticker = document.getElementById("ticker").value.trim().toUpperCase();
+  if (!ticker) return;
+  const payload = { ticker };
+
+  const button = document.getElementById("analyze-btn");
+  button.disabled = true;
+  button.innerText = "Analyzing...";
+
+  try {
+    const resp = await fetch("/api/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const json = await resp.json();
+
+    if (!resp.ok || json.error) {
+      alert("Error: " + (json.error || ("Request failed (" + resp.status + ")")));
+      return;
+    }
+    if (!json.stock) {
+      alert("Error: Analysis completed but no stock data was returned.");
+      return;
+    }
+
+    const stock = json.stock;
+    const price = stock.price ?? "N/A";
+    const change = stock.change_pct;
+    const pe = stock.pe_ratio ?? "N/A";
+    const beta = stock.beta ?? "N/A";
+    const changeNum = parseFloat(change);
+    let changeColor = "black";
+    if (change !== null && change !== undefined && change !== "N/A" && !isNaN(changeNum)) {
+      changeColor = changeNum > 0 ? "green" : changeNum < 0 ? "red" : "black";
+    }
+
+    document.getElementById("analysis-title").innerText =
+      (stock.company || ticker) + " (" + (stock.ticker || ticker) + ")";
+    document.getElementById("analysis-price").innerText = price;
+    const changeEl = document.getElementById("analysis-change");
+    if (change === null || change === undefined || change === "N/A" || isNaN(changeNum)) {
+      changeEl.style.color = "black";
+      changeEl.innerText = "N/A";
+    } else {
+      changeEl.style.color = changeColor;
+      changeEl.innerText = changeNum + "%";
+    }
+    document.getElementById("analysis-pe").innerText = pe;
+    document.getElementById("analysis-beta").innerText = beta;
+    document.getElementById("analysis-insight").innerHTML = json.insight_html || formatInsight(json.insight);
+
+    document.getElementById("analysis-area").style.display = "block";
+    renderPriceChart(json.history_preview, changeColor);
+    document.getElementById("analysis-area").scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (error) {
+    alert("Network Error: Could not complete analysis. " + (error && error.message ? error.message : ""));
+  } finally {
+    button.disabled = false;
+    button.innerText = "Analyze";
+  }
+});
+
+const tickerInput = document.getElementById("ticker");
+// Prefill from ?ticker= or /analyze/<TICKER>, then auto-submit if a value is present.
+const params = new URLSearchParams(window.location.search);
+let fromUrl = (params.get("ticker") || "").trim().toUpperCase();
+if (!fromUrl) {
+  const parts = window.location.pathname.split("/").filter(Boolean);
+  if (parts.length >= 2 && parts[0] === "analyze") {
+    fromUrl = decodeURIComponent(parts[1] || "").trim().toUpperCase();
+  }
+}
+if (fromUrl) tickerInput.value = fromUrl;
+if (tickerInput.value.trim()) {
+  document.getElementById("analyze-form").requestSubmit();
+}
+</script>
+{% endblock %}
