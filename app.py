@@ -198,7 +198,8 @@ def api_analyze():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/report/brief.pdf")
+@app.route("/report/brief.pdf", endpoint="brief_report")
+@app.route("/report/portfolio.pdf", endpoint="portfolio_report")
 def brief_report():
     """Send a PDF of the current session brief, or redirect home if none exists."""
     insight = session.get("latest_insight")
