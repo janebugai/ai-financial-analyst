@@ -23,11 +23,8 @@ load_dotenv()
 
 INSIGHT_PROMPT_TEMPLATE = """
 You are a helpful financial analyst. Given the ticker {ticker} and the following data,
-produce a concise investment analysis (3–6 short paragraphs) covering:
-- recent price action summary
-- key fundamental metrics (PE, beta)
-- risk considerations
-- investment thesis and recommended time horizon
+write a concise investment brief (2–3 short paragraphs) covering recent price action,
+key metrics if available (PE, beta), main risks, and a simple thesis.
 
 Raw data:
 {raw_summary}
@@ -54,6 +51,15 @@ except Exception:
     traceback.print_exc()
     client = None
 
+_predictor = None
+
+
+def _dspy_predictor():
+    global _predictor
+    if _predictor is None:
+        _predictor = dspy.Predict("input_text -> analysis_text")
+    return _predictor
+
 
 def dsp_financial_insight(ticker: str, stock_data: Dict) -> str:
     """Return a 3–6 paragraph analysis string for ``ticker`` given ``stock_data``.
@@ -77,8 +83,7 @@ def dsp_financial_insight(ticker: str, stock_data: Dict) -> str:
 
         if USE_DSPY and lm is not None:
             try:
-                predictor = dspy.Predict("input_text -> analysis_text")
-                result = predictor(input_text=prompt)
+                result = _dspy_predictor()(input_text=prompt)
                 return getattr(result, "analysis_text", str(result))
             except Exception as e:
                 last_error = e
@@ -93,7 +98,7 @@ def dsp_financial_insight(ticker: str, stock_data: Dict) -> str:
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.2,
-                    max_tokens=700,
+                    max_tokens=400,
                 )
                 return response.choices[0].message.content.strip()
             except Exception as e:
