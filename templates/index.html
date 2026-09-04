@@ -67,6 +67,14 @@ function formatInsight(text) {
 
 let priceChart = null;
 
+/** Always show two decimals for numeric metrics (JSON drops trailing zeros). */
+function formatMetric(value) {
+  if (value === null || value === undefined || value === "N/A" || value === "") return "N/A";
+  const num = Number(value);
+  if (Number.isNaN(num)) return String(value);
+  return num.toFixed(2);
+}
+
 /** Short month/day label for chart x-axis ticks. */
 function formatChartDate(value) {
   const date = new Date(value);
@@ -228,10 +236,10 @@ document.getElementById("analyze-form").addEventListener("submit", async functio
     }
 
     const stock = json.stock;
-    const price = stock.price ?? "N/A";
+    const price = formatMetric(stock.price);
     const change = stock.change_pct;
-    const pe = stock.pe_ratio ?? "N/A";
-    const beta = stock.beta ?? "N/A";
+    const pe = formatMetric(stock.pe_ratio);
+    const beta = formatMetric(stock.beta);
     const changeNum = parseFloat(change);
     let changeColor = "black";
     if (change !== null && change !== undefined && change !== "N/A" && !isNaN(changeNum)) {
