@@ -9,6 +9,7 @@ fallback so a hung request cannot block Analyze.
 """
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import date, timedelta
 from io import StringIO
@@ -249,25 +250,44 @@ def _history_stooq(ticker, session):
     return hist_df if not hist_df.empty else None
 
 
-def _fundamentals(stock):
-    if stock is None:
+def _yahoo_pe_beta(ticker, session):
+    """Trailing P/E and beta from yfinance. Can hang or 429 on cloud IPs."""
+    stock = yf.Ticker(ticker, session=session)
+    info = stock.info or {}
+    return {
+        "trailingPE": info.get("trailingPE"),
+        "beta": info.get("beta"),
+    }
+
+
+def _alphavantage_pe_beta(ticker, session):
+    """P/E and beta from Alpha Vantage OVERVIEW when ALPHA_VANTAGE_API_KEY is set."""
+    key = os.getenv("ALPHA_VANTAGE_API_KEY")
+    if not key:
         return {}
-    try:
-        info = stock.info or {}
-        if info:
-            return info
-    except Exception as e:
-        print(f"[get_stock_data] stock.info unavailable: {e}")
-    try:
-        fast = stock.fast_info
-        return {
-            "trailingPE": getattr(fast, "trailingPE", None),
-            "beta": getattr(fast, "beta", None),
-            "shortName": getattr(fast, "shortName", None),
-        }
-    except Exception as e:
-        print(f"[get_stock_data] fast_info unavailable: {e}")
-        return {}
+    response = session.get(
+        "https://www.alphavantage.co/query",
+        params={"function": "OVERVIEW", "symbol": ticker, "apikey": key},
+        timeout=6,
+    )
+    response.raise_for_status()
+    data = response.json() or {}
+    out = {}
+    pe = _parse_nasdaq_number(data.get("PERatio"))
+    beta = _parse_nasdaq_number(data.get("Beta"))
+    if pe is not None:
+        out["trailingPE"] = pe
+    if beta is not None:
+        out["beta"] = beta
+    return out
+
+
+def _merge_fundamentals(info, extra):
+    for key in ("trailingPE", "beta"):
+        value = (extra or {}).get(key)
+        if value not in (None, "", "N/A") and info.get(key) in (None, "", "N/A"):
+            info[key] = value
+    return info
 
 
 def get_stock_data(ticker):
@@ -305,11 +325,10 @@ def get_stock_data(ticker):
         return None
 
     info = dict(nasdaq_info or {})
-    if stock is not None:
-        yf_info = _run_timeout(lambda: _fundamentals(stock), 6) or {}
-        for key, value in yf_info.items():
-            if value not in (None, "", "N/A") and key not in info:
-                info[key] = value
+    yahoo_stats = _run_timeout(lambda: _yahoo_pe_beta(ticker, session), 4) or {}
+    _merge_fundamentals(info, yahoo_stats)
+    if info.get("trailingPE") in (None, "", "N/A") or info.get("beta") in (None, "", "N/A"):
+        _merge_fundamentals(info, _run_timeout(lambda: _alphavantage_pe_beta(ticker, session), 6) or {})
 
     def safe_get_round(key, default="N/A"):
         val = info.get(key)
