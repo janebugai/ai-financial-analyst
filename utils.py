@@ -22,7 +22,13 @@ except ImportError:
     cffi_requests = None
 
 
+_SESSION = None
+
+
 def _http_session():
+    global _SESSION
+    if _SESSION is not None:
+        return _SESSION
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -36,11 +42,12 @@ def _http_session():
     if cffi_requests is not None:
         session = cffi_requests.Session(impersonate="chrome")
         session.headers.update(headers)
-        return session
-    import requests
-    session = requests.Session()
-    session.headers.update(headers)
-    return session
+    else:
+        import requests
+        session = requests.Session()
+        session.headers.update(headers)
+    _SESSION = session
+    return _SESSION
 
 
 def _run_timeout(fn, seconds):
@@ -88,36 +95,56 @@ def _parse_nasdaq_number(value):
         return None
 
 
+def _nasdaq_history(ticker, session, assetclass, start, end):
+    hist = session.get(
+        f"https://api.nasdaq.com/api/quote/{ticker}/historical",
+        params={
+            "assetclass": assetclass,
+            "fromdate": start.isoformat(),
+            "todate": end.isoformat(),
+            "limit": 40,
+        },
+        timeout=8,
+    )
+    hist.raise_for_status()
+    rows = (((hist.json() or {}).get("data") or {}).get("tradesTable") or {}).get("rows") or []
+    points = []
+    for row in rows:
+        close = _parse_nasdaq_number(row.get("close"))
+        if close is None:
+            continue
+        points.append({"Date": pd.to_datetime(row.get("date")), "Close": close})
+    if not points:
+        return None
+    hist_df = (
+        pd.DataFrame(points)
+        .dropna(subset=["Date", "Close"])
+        .set_index("Date")
+        .sort_index()
+        .tail(30)
+    )
+    return hist_df if not hist_df.empty else None
+
+
 def _nasdaq_quote(ticker, session):
-    """History + company/sector from Nasdaq's public quote API (no API key)."""
+    """History first, then one profile call. Avoid extra Nasdaq round-trips."""
     end = date.today()
     start = end - timedelta(days=50)
     info = {}
-    hist_df = None
 
     for assetclass in ("stocks", "etf"):
         try:
-            summary = session.get(
-                f"https://api.nasdaq.com/api/quote/{ticker}/summary",
-                params={"assetclass": assetclass},
-                timeout=12,
-            )
-            if summary.status_code == 200:
-                payload = (summary.json() or {}).get("data") or {}
-                summary_data = payload.get("summaryData") or {}
-                sector = (summary_data.get("Sector") or {}).get("value")
-                industry = (summary_data.get("Industry") or {}).get("value")
-                if sector:
-                    info["sector"] = sector
-                if industry:
-                    info["industry"] = industry
+            hist_df = _nasdaq_history(ticker, session, assetclass, start, end)
         except Exception as e:
-            print(f"[get_stock_data] Nasdaq summary failed ({assetclass}): {e}")
+            print(f"[get_stock_data] Nasdaq history failed ({assetclass}): {e}")
+            continue
+        if hist_df is None:
+            continue
 
         try:
             profile = session.get(
                 f"https://api.nasdaq.com/api/company/{ticker}/company-profile",
-                timeout=12,
+                timeout=6,
             )
             if profile.status_code == 200:
                 pdata = (profile.json() or {}).get("data") or {}
@@ -133,55 +160,19 @@ def _nasdaq_quote(ticker, session):
         except Exception as e:
             print(f"[get_stock_data] Nasdaq profile failed: {e}")
 
-        try:
-            hist = session.get(
-                f"https://api.nasdaq.com/api/quote/{ticker}/historical",
-                params={
-                    "assetclass": assetclass,
-                    "fromdate": start.isoformat(),
-                    "todate": end.isoformat(),
-                    "limit": 40,
-                },
-                timeout=12,
-            )
-            hist.raise_for_status()
-            rows = (
-                ((hist.json() or {}).get("data") or {})
-                .get("tradesTable") or {}
-            ).get("rows") or []
-            points = []
-            for row in rows:
-                close = _parse_nasdaq_number(row.get("close"))
-                if close is None:
-                    continue
-                points.append({
-                    "Date": pd.to_datetime(row.get("date")),
-                    "Close": close,
-                })
-            if points:
-                hist_df = (
-                    pd.DataFrame(points)
-                    .dropna(subset=["Date", "Close"])
-                    .set_index("Date")
-                    .sort_index()
-                    .tail(30)
+        if not info.get("longName"):
+            try:
+                quote = session.get(
+                    f"https://api.nasdaq.com/api/quote/{ticker}/info",
+                    params={"assetclass": assetclass},
+                    timeout=6,
                 )
-                if not hist_df.empty:
-                    if not info.get("longName"):
-                        try:
-                            quote = session.get(
-                                f"https://api.nasdaq.com/api/quote/{ticker}/info",
-                                params={"assetclass": assetclass},
-                                timeout=12,
-                            )
-                            company = ((quote.json() or {}).get("data") or {}).get("companyName")
-                            if company:
-                                info["longName"] = company.replace(" Common Stock", "").strip()
-                        except Exception:
-                            pass
-                    return hist_df, info
-        except Exception as e:
-            print(f"[get_stock_data] Nasdaq history failed ({assetclass}): {e}")
+                company = ((quote.json() or {}).get("data") or {}).get("companyName")
+                if company:
+                    info["longName"] = company.replace(" Common Stock", "").strip()
+            except Exception:
+                pass
+        return hist_df, info
 
     return None, info
 
@@ -269,17 +260,17 @@ def get_stock_data(ticker):
         print(f"[get_stock_data] Nasdaq failed for {ticker}: {e}")
 
     if hist_df is None:
-        result = _run_timeout(lambda: _history_yfinance(ticker, session), 8)
+        result = _run_timeout(lambda: _history_yfinance(ticker, session), 4)
         if result:
             stock, hist_df = result
 
     if hist_df is None:
-        chart = _run_timeout(lambda: _history_yahoo_chart(ticker, session), 8)
+        chart = _run_timeout(lambda: _history_yahoo_chart(ticker, session), 4)
         if chart:
             hist_df, chart_meta = chart
 
     if hist_df is None:
-        hist_df = _run_timeout(lambda: _history_stooq(ticker, session), 8)
+        hist_df = _run_timeout(lambda: _history_stooq(ticker, session), 4)
 
     if hist_df is None:
         print(f"[get_stock_data] no price history for {ticker}")

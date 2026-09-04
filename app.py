@@ -15,6 +15,7 @@ touch ``site-packages`` during a request and abort Analyze in the browser.
 """
 
 import os
+import time
 import traceback
 import markdown
 
@@ -167,11 +168,15 @@ def api_analyze():
         if not ticker:
             return jsonify({"error": "Ticker required"}), 400
 
+        t0 = time.perf_counter()
         stock_data = get_stock_data(ticker)
+        t1 = time.perf_counter()
         if not stock_data:
             return jsonify({"error": f"No data found for {ticker}"}), 404
 
         insight = dsp_financial_insight(ticker, stock_data)
+        t2 = time.perf_counter()
+        print(f"[analyze {ticker}] data={t1 - t0:.1f}s insight={t2 - t1:.1f}s total={t2 - t0:.1f}s")
         history = stock_data.get("history_json") or []
         history_preview = history[-30:] if isinstance(history, list) else []
 
