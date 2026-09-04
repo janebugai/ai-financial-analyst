@@ -126,8 +126,43 @@ def _nasdaq_history(ticker, session, assetclass, start, end):
     return hist_df if not hist_df.empty else None
 
 
+def _nasdaq_live_quote(ticker, session, assetclass):
+    """Last sale and company name from Nasdaq's real-time quote card."""
+    quote = session.get(
+        f"https://api.nasdaq.com/api/quote/{ticker}/info",
+        params={"assetclass": assetclass},
+        timeout=6,
+    )
+    quote.raise_for_status()
+    data = (quote.json() or {}).get("data") or {}
+    primary = data.get("primaryData") or {}
+    info = {}
+    company = data.get("companyName")
+    if company:
+        info["longName"] = company.replace(" Common Stock", "").strip()
+    last_sale = _parse_nasdaq_number(primary.get("lastSalePrice"))
+    if last_sale is not None:
+        info["lastSale"] = last_sale
+    return info
+
+
+def _merge_live_close(hist_df, last_sale):
+    """Put today's last sale on the chart so the last point is not yesterday's close."""
+    if hist_df is None or hist_df.empty or last_sale is None:
+        return hist_df
+    today = pd.Timestamp(date.today()).normalize()
+    last_day = pd.Timestamp(hist_df.index[-1]).normalize()
+    updated = hist_df.copy()
+    if last_day == today:
+        updated.loc[updated.index[-1], "Close"] = last_sale
+    elif last_day < today:
+        updated = pd.concat([updated, pd.DataFrame({"Close": [last_sale]}, index=[today])])
+        updated = updated.tail(30)
+    return updated
+
+
 def _nasdaq_quote(ticker, session):
-    """History first, then one profile call. Avoid extra Nasdaq round-trips."""
+    """Daily history, then live last sale + company/sector."""
     end = date.today()
     start = end - timedelta(days=50)
     info = {}
@@ -142,6 +177,11 @@ def _nasdaq_quote(ticker, session):
             continue
 
         try:
+            info.update(_nasdaq_live_quote(ticker, session, assetclass))
+        except Exception as e:
+            print(f"[get_stock_data] Nasdaq live quote failed: {e}")
+
+        try:
             profile = session.get(
                 f"https://api.nasdaq.com/api/company/{ticker}/company-profile",
                 timeout=6,
@@ -149,7 +189,7 @@ def _nasdaq_quote(ticker, session):
             if profile.status_code == 200:
                 pdata = (profile.json() or {}).get("data") or {}
                 name = (pdata.get("CompanyName") or {}).get("value")
-                if name:
+                if name and not info.get("longName"):
                     info["longName"] = name
                 sector = (pdata.get("Sector") or {}).get("value")
                 industry = (pdata.get("Industry") or {}).get("value")
@@ -160,18 +200,6 @@ def _nasdaq_quote(ticker, session):
         except Exception as e:
             print(f"[get_stock_data] Nasdaq profile failed: {e}")
 
-        if not info.get("longName"):
-            try:
-                quote = session.get(
-                    f"https://api.nasdaq.com/api/quote/{ticker}/info",
-                    params={"assetclass": assetclass},
-                    timeout=6,
-                )
-                company = ((quote.json() or {}).get("data") or {}).get("companyName")
-                if company:
-                    info["longName"] = company.replace(" Common Stock", "").strip()
-            except Exception:
-                pass
         return hist_df, info
 
     return None, info
@@ -287,7 +315,30 @@ def get_stock_data(ticker):
         val = info.get(key)
         return round(val, 2) if isinstance(val, (int, float)) else default
 
-    price, change_pct = _price_from_history(hist_df)
+    last_sale = info.get("lastSale")
+    if last_sale is None:
+        last_sale = chart_meta.get("regularMarketPrice")
+        if last_sale is not None:
+            try:
+                last_sale = float(last_sale)
+            except (TypeError, ValueError):
+                last_sale = None
+
+    if last_sale is not None:
+        last_day = pd.Timestamp(hist_df.index[-1]).normalize()
+        today = pd.Timestamp(date.today()).normalize()
+        if last_day == today and len(hist_df) > 1:
+            prev_close = float(hist_df["Close"].iloc[-2])
+        else:
+            prev_close = float(hist_df["Close"].iloc[-1])
+        hist_df = _merge_live_close(hist_df, last_sale)
+        price = round(float(last_sale), 2)
+        change_pct = (
+            round(((float(last_sale) - prev_close) / prev_close * 100), 2)
+            if prev_close else "N/A"
+        )
+    else:
+        price, change_pct = _price_from_history(hist_df)
     company = (
         info.get("longName")
         or info.get("shortName")
