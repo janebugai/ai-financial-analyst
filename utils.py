@@ -1,14 +1,16 @@
-"""Yahoo Finance helpers for AI Investment Brief.
+"""Market-data helpers for AI Investment Brief.
 
 ``get_stock_data`` returns a JSON-friendly dict of company metrics plus daily
 history, or ``None`` if every data source fails.
 
-Yahoo often rate-limits datacenter IPs (Render, etc.). History and fundamentals
-are fetched separately so one failure does not discard the other, and Stooq is
-used as a price fallback.
+Yahoo Finance often rate-limits or hangs from datacenter IPs (Render). Nasdaq's
+public quote API is tried first. Yahoo/yfinance run only as a short-timeout
+fallback so a hung request cannot block Analyze.
 """
 
 import json
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from datetime import date, timedelta
 from io import StringIO
 
 import pandas as pd
@@ -21,17 +23,39 @@ except ImportError:
 
 
 def _http_session():
-    if cffi_requests is not None:
-        return cffi_requests.Session(impersonate="chrome")
-    import requests
-    session = requests.Session()
-    session.headers.update({
+    headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         ),
-    })
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nasdaq.com/",
+        "Origin": "https://www.nasdaq.com",
+    }
+    if cffi_requests is not None:
+        session = cffi_requests.Session(impersonate="chrome")
+        session.headers.update(headers)
+        return session
+    import requests
+    session = requests.Session()
+    session.headers.update(headers)
     return session
+
+
+def _run_timeout(fn, seconds):
+    """Run ``fn`` in a worker thread; return None if it exceeds ``seconds``."""
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        return executor.submit(fn).result(timeout=seconds)
+    except FuturesTimeout:
+        print(f"[get_stock_data] timed out after {seconds}s")
+        return None
+    except Exception as e:
+        print(f"[get_stock_data] {e}")
+        return None
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _hist_to_records(hist_df):
@@ -52,19 +76,127 @@ def _price_from_history(hist_df):
     return round(price_val, 2), change_pct
 
 
+def _parse_nasdaq_number(value):
+    if value is None:
+        return None
+    text = str(value).replace("$", "").replace(",", "").replace("%", "").strip()
+    if not text or text in {"N/A", "NA", "--"}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _nasdaq_quote(ticker, session):
+    """History + company/sector from Nasdaq's public quote API (no API key)."""
+    end = date.today()
+    start = end - timedelta(days=50)
+    info = {}
+    hist_df = None
+
+    for assetclass in ("stocks", "etf"):
+        try:
+            summary = session.get(
+                f"https://api.nasdaq.com/api/quote/{ticker}/summary",
+                params={"assetclass": assetclass},
+                timeout=12,
+            )
+            if summary.status_code == 200:
+                payload = (summary.json() or {}).get("data") or {}
+                summary_data = payload.get("summaryData") or {}
+                sector = (summary_data.get("Sector") or {}).get("value")
+                industry = (summary_data.get("Industry") or {}).get("value")
+                if sector:
+                    info["sector"] = sector
+                if industry:
+                    info["industry"] = industry
+        except Exception as e:
+            print(f"[get_stock_data] Nasdaq summary failed ({assetclass}): {e}")
+
+        try:
+            profile = session.get(
+                f"https://api.nasdaq.com/api/company/{ticker}/company-profile",
+                timeout=12,
+            )
+            if profile.status_code == 200:
+                pdata = (profile.json() or {}).get("data") or {}
+                name = (pdata.get("CompanyName") or {}).get("value")
+                if name:
+                    info["longName"] = name
+                sector = (pdata.get("Sector") or {}).get("value")
+                industry = (pdata.get("Industry") or {}).get("value")
+                if sector:
+                    info["sector"] = sector
+                if industry:
+                    info["industry"] = industry
+        except Exception as e:
+            print(f"[get_stock_data] Nasdaq profile failed: {e}")
+
+        try:
+            hist = session.get(
+                f"https://api.nasdaq.com/api/quote/{ticker}/historical",
+                params={
+                    "assetclass": assetclass,
+                    "fromdate": start.isoformat(),
+                    "todate": end.isoformat(),
+                    "limit": 40,
+                },
+                timeout=12,
+            )
+            hist.raise_for_status()
+            rows = (
+                ((hist.json() or {}).get("data") or {})
+                .get("tradesTable") or {}
+            ).get("rows") or []
+            points = []
+            for row in rows:
+                close = _parse_nasdaq_number(row.get("close"))
+                if close is None:
+                    continue
+                points.append({
+                    "Date": pd.to_datetime(row.get("date")),
+                    "Close": close,
+                })
+            if points:
+                hist_df = (
+                    pd.DataFrame(points)
+                    .dropna(subset=["Date", "Close"])
+                    .set_index("Date")
+                    .sort_index()
+                    .tail(30)
+                )
+                if not hist_df.empty:
+                    if not info.get("longName"):
+                        try:
+                            quote = session.get(
+                                f"https://api.nasdaq.com/api/quote/{ticker}/info",
+                                params={"assetclass": assetclass},
+                                timeout=12,
+                            )
+                            company = ((quote.json() or {}).get("data") or {}).get("companyName")
+                            if company:
+                                info["longName"] = company.replace(" Common Stock", "").strip()
+                        except Exception:
+                            pass
+                    return hist_df, info
+        except Exception as e:
+            print(f"[get_stock_data] Nasdaq history failed ({assetclass}): {e}")
+
+    return None, info
+
+
 def _history_yfinance(ticker, session):
     stock = yf.Ticker(ticker, session=session)
     hist_df = stock.history(period="30d", interval="1d")
-    return stock, hist_df if hist_df is not None and not hist_df.empty else None
+    if hist_df is None or hist_df.empty:
+        return stock, None
+    return stock, hist_df
 
 
 def _history_yahoo_chart(ticker, session):
-    """Yahoo chart endpoint without yfinance's cookie/crumb flow.
-
-    Returns ``(hist_df, meta)``. ``meta`` may include shortName / longName.
-    """
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    response = session.get(url, params={"range": "1mo", "interval": "1d"}, timeout=20)
+    response = session.get(url, params={"range": "1mo", "interval": "1d"}, timeout=8)
     response.raise_for_status()
     result = response.json()["chart"]["result"][0]
     meta = result.get("meta") or {}
@@ -81,15 +213,14 @@ def _history_yahoo_chart(ticker, session):
 
 
 def _history_stooq(ticker, session):
-    """Daily closes from Stooq; more tolerant of cloud IPs than Yahoo."""
     symbol = ticker.lower()
     if "." not in symbol:
         symbol = f"{symbol}.us"
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    response = session.get(url, timeout=20)
+    response = session.get(url, timeout=8)
     response.raise_for_status()
     text = response.text.strip()
-    if not text or text.lower().startswith("no data") or "not found" in text.lower():
+    if not text or "<html" in text.lower() or text.lower().startswith("no data"):
         return None
     hist_df = pd.read_csv(StringIO(text))
     if "Close" not in hist_df.columns or hist_df.empty:
@@ -121,12 +252,7 @@ def _fundamentals(stock):
 
 
 def get_stock_data(ticker):
-    """Fetch about 30 days of daily bars and fundamentals for ``ticker``.
-
-    Returns a dict with ticker, company, sector, price, change_pct, pe_ratio,
-    beta, and history_json. Returns ``None`` only when no price history is
-    available from Yahoo or Stooq.
-    """
+    """Fetch about 30 days of daily bars and fundamentals for ``ticker``."""
     ticker = (ticker or "").strip().upper()
     if not ticker:
         return None
@@ -134,32 +260,37 @@ def get_stock_data(ticker):
     session = _http_session()
     stock = None
     hist_df = None
+    chart_meta = {}
+    nasdaq_info = {}
 
     try:
-        stock, hist_df = _history_yfinance(ticker, session)
+        hist_df, nasdaq_info = _nasdaq_quote(ticker, session)
     except Exception as e:
-        print(f"[get_stock_data] yfinance history failed for {ticker}: {e}")
-        stock = None
-
-    chart_meta = {}
-    if hist_df is None:
-        try:
-            hist_df, chart_meta = _history_yahoo_chart(ticker, session)
-        except Exception as e:
-            print(f"[get_stock_data] Yahoo chart failed for {ticker}: {e}")
-            chart_meta = {}
+        print(f"[get_stock_data] Nasdaq failed for {ticker}: {e}")
 
     if hist_df is None:
-        try:
-            hist_df = _history_stooq(ticker, session)
-        except Exception as e:
-            print(f"[get_stock_data] Stooq failed for {ticker}: {e}")
+        result = _run_timeout(lambda: _history_yfinance(ticker, session), 8)
+        if result:
+            stock, hist_df = result
+
+    if hist_df is None:
+        chart = _run_timeout(lambda: _history_yahoo_chart(ticker, session), 8)
+        if chart:
+            hist_df, chart_meta = chart
+
+    if hist_df is None:
+        hist_df = _run_timeout(lambda: _history_stooq(ticker, session), 8)
 
     if hist_df is None:
         print(f"[get_stock_data] no price history for {ticker}")
         return None
 
-    info = _fundamentals(stock)
+    info = dict(nasdaq_info or {})
+    if stock is not None:
+        yf_info = _run_timeout(lambda: _fundamentals(stock), 6) or {}
+        for key, value in yf_info.items():
+            if value not in (None, "", "N/A") and key not in info:
+                info[key] = value
 
     def safe_get_round(key, default="N/A"):
         val = info.get(key)
